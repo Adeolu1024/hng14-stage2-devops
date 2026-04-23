@@ -1,0 +1,434 @@
+name: CI/CD Pipeline
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+env:
+  REGISTRY: localhost:5000
+  REDIS_PASSWORD: testpassword123
+
+jobs:
+  lint:
+    name: Lint
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install flake8
+        run: pip install flake8
+
+      - name: Run flake8
+        run: flake8 api/ worker/ --count --select=E9,F63,F7,F82 --show-source --statistics
+
+      - name: Set up Node.js
+        uses: actions/setup-node@v4
+        with:
+          node-version: "20"
+
+      - name: Install ESLint
+        run: |
+          cd frontend
+          npm install eslint
+
+      - name: Run ESLint
+        run: |
+          cd frontend
+          npx eslint --no-eslintrc --env browser,node,es2021 --parser-options=ecmaVersion:2021 app.js || true
+
+      - name: Run hadolint
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: api/Dockerfile
+
+      - name: Run hadolint on frontend
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: frontend/Dockerfile
+
+      - name: Run hadolint on worker
+        uses: hadolint/hadolint-action@v3.1.0
+        with:
+          dockerfile: worker/Dockerfile
+
+  test:
+    name: Test
+    runs-on: ubuntu-latest
+    needs: lint
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Python
+        uses: actions/setup-python@v5
+        with:
+          python-version: "3.11"
+
+      - name: Install dependencies
+        run: |
+          cd api
+          pip install -r requirements.txt
+
+      - name: Run tests with coverage
+        run: |
+          cd api
+          pytest test_main.py -v --cov=. --cov-report=xml --cov-report=term
+
+      - name: Upload coverage report
+        uses: actions/upload-artifact@v4
+        with:
+          name: coverage-report
+          path: api/coverage.xml
+
+  build:
+    name: Build
+    runs-on: ubuntu-latest
+    needs: test
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v3
+
+      - name: Build and push API image
+        run: |
+          docker build -t ${{ env.REGISTRY }}/api:${{ github.sha }} -t ${{ env.REGISTRY }}/api:latest ./api
+          docker push ${{ env.REGISTRY }}/api:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/api:latest
+
+      - name: Build and push Frontend image
+        run: |
+          docker build -t ${{ env.REGISTRY }}/frontend:${{ github.sha }} -t ${{ env.REGISTRY }}/frontend:latest ./frontend
+          docker push ${{ env.REGISTRY }}/frontend:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/frontend:latest
+
+      - name: Build and push Worker image
+        run: |
+          docker build -t ${{ env.REGISTRY }}/worker:${{ github.sha }} -t ${{ env.REGISTRY }}/worker:latest ./worker
+          docker push ${{ env.REGISTRY }}/worker:${{ github.sha }}
+          docker push ${{ env.REGISTRY }}/worker:latest
+
+  security-scan:
+    name: Security Scan
+    runs-on: ubuntu-latest
+    needs: build
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Run Trivy on API image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/api:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-api-results.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Run Trivy on Frontend image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/frontend:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-frontend-results.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Run Trivy on Worker image
+        uses: aquasecurity/trivy-action@master
+        with:
+          image-ref: ${{ env.REGISTRY }}/worker:${{ github.sha }}
+          format: "sarif"
+          output: "trivy-worker-results.sarif"
+          severity: "CRITICAL,HIGH,MEDIUM,LOW"
+          exit-code: "1"
+          ignore-unfixed: true
+
+      - name: Upload Trivy SARIF results
+        uses: actions/upload-artifact@v4
+        if: always()
+        with:
+          name: trivy-sarif-results
+          path: trivy-*-results.sarif
+
+  integration-test:
+    name: Integration Test
+    runs-on: ubuntu-latest
+    needs: build
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull images from registry
+        run: |
+          docker pull ${{ env.REGISTRY }}/api:${{ github.sha }}
+          docker pull ${{ env.REGISTRY }}/frontend:${{ github.sha }}
+          docker pull ${{ env.REGISTRY }}/worker:${{ github.sha }}
+
+      - name: Tag images for local use
+        run: |
+          docker tag ${{ env.REGISTRY }}/api:${{ github.sha }} job-api:${{ github.sha }}
+          docker tag ${{ env.REGISTRY }}/frontend:${{ github.sha }} job-frontend:${{ github.sha }}
+          docker tag ${{ env.REGISTRY }}/worker:${{ github.sha }} job-worker:${{ github.sha }}
+
+      - name: Create integration compose file
+        run: |
+          cat > docker-compose.integration.yml << 'EOF'
+          services:
+            redis:
+              image: redis:7-alpine
+              command: redis-server --requirepass testpassword123
+              networks:
+                - test-network
+              healthcheck:
+                test: ["CMD", "redis-cli", "-a", "testpassword123", "ping"]
+                interval: 5s
+                timeout: 3s
+                retries: 5
+                start_period: 5s
+
+            api:
+              image: job-api:${{ github.sha }}
+              environment:
+                - REDIS_HOST=redis
+                - REDIS_PORT=6379
+                - REDIS_PASSWORD=testpassword123
+              networks:
+                - test-network
+              depends_on:
+                redis:
+                  condition: service_healthy
+              healthcheck:
+                test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+                interval: 5s
+                timeout: 3s
+                retries: 5
+                start_period: 10s
+
+            worker:
+              image: job-worker:${{ github.sha }}
+              environment:
+                - REDIS_HOST=redis
+                - REDIS_PORT=6379
+                - REDIS_PASSWORD=testpassword123
+              networks:
+                - test-network
+              depends_on:
+                redis:
+                  condition: service_healthy
+
+            frontend:
+              image: job-frontend:${{ github.sha }}
+              ports:
+                - "3000:3000"
+              environment:
+                - API_URL=http://api:8000
+                - PORT=3000
+              networks:
+                - test-network
+              depends_on:
+                api:
+                  condition: service_healthy
+              healthcheck:
+                test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+                interval: 5s
+                timeout: 3s
+                retries: 5
+                start_period: 10s
+
+          networks:
+            test-network:
+              driver: bridge
+          EOF
+
+      - name: Start stack
+        run: docker compose -f docker-compose.integration.yml up -d
+
+      - name: Wait for services to be healthy
+        run: |
+          for i in $(seq 1 30); do
+            healthy=true
+            for svc in api frontend; do
+              status=$(docker inspect --format='{{.State.Health.Status}}' "hng14-stage2-devops-$svc-1" 2>/dev/null || echo "not_found")
+              if [ "$status" != "healthy" ]; then
+                healthy=false
+                break
+              fi
+            done
+            if [ "$healthy" = true ]; then
+              echo "All services healthy"
+              break
+            fi
+            echo "Waiting for services... ($i)"
+            sleep 5
+          done
+
+      - name: Submit job and verify completion
+        run: |
+          echo "Submitting job..."
+          response=$(curl -s -X POST http://localhost:3000/submit)
+          echo "Response: $response"
+          job_id=$(echo $response | python3 -c "import sys, json; print(json.load(sys.stdin)['job_id'])")
+          echo "Job ID: $job_id"
+
+          echo "Polling for job completion..."
+          for i in $(seq 1 30); do
+            status_response=$(curl -s http://localhost:3000/status/$job_id)
+            echo "Status response: $status_response"
+            status=$(echo $status_response | python3 -c "import sys, json; print(json.load(sys.stdin)['status'])")
+            echo "Status: $status"
+            if [ "$status" = "completed" ]; then
+              echo "Job completed successfully!"
+              exit 0
+            fi
+            sleep 2
+          done
+
+          echo "Job did not complete within timeout"
+          exit 1
+
+      - name: Tear down stack
+        if: always()
+        run: docker compose -f docker-compose.integration.yml down -v
+
+  deploy:
+    name: Deploy
+    runs-on: ubuntu-latest
+    needs: [build, security-scan, integration-test]
+    if: github.ref == 'refs/heads/main' && github.event_name == 'push'
+    services:
+      registry:
+        image: registry:2
+        ports:
+          - 5000:5000
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Pull images from registry
+        run: |
+          docker pull ${{ env.REGISTRY }}/api:${{ github.sha }}
+          docker pull ${{ env.REGISTRY }}/frontend:${{ github.sha }}
+          docker pull ${{ env.REGISTRY }}/worker:${{ github.sha }}
+
+      - name: Tag images for deployment
+        run: |
+          docker tag ${{ env.REGISTRY }}/api:${{ github.sha }} job-api:latest
+          docker tag ${{ env.REGISTRY }}/frontend:${{ github.sha }} job-frontend:latest
+          docker tag ${{ env.REGISTRY }}/worker:${{ github.sha }} job-worker:latest
+
+      - name: Deploy with rolling update
+        run: |
+          echo "Starting rolling deployment..."
+
+          docker compose down --remove-orphans 2>/dev/null || true
+
+          cat > docker-compose.deploy.yml << 'COMPOSE_EOF'
+          services:
+            redis:
+              image: redis:7-alpine
+              command: redis-server --requirepass ${REDIS_PASSWORD}
+              networks:
+                - app-network
+              healthcheck:
+                test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+                interval: 5s
+                timeout: 3s
+                retries: 5
+                start_period: 5s
+
+            api:
+              image: job-api:latest
+              environment:
+                - REDIS_HOST=redis
+                - REDIS_PORT=6379
+                - REDIS_PASSWORD=${REDIS_PASSWORD}
+              networks:
+                - app-network
+              depends_on:
+                redis:
+                  condition: service_healthy
+              healthcheck:
+                test: ["CMD", "python", "-c", "import urllib.request; urllib.request.urlopen('http://localhost:8000/health')"]
+                interval: 5s
+                timeout: 3s
+                retries: 12
+                start_period: 10s
+
+            worker:
+              image: job-worker:latest
+              environment:
+                - REDIS_HOST=redis
+                - REDIS_PORT=6379
+                - REDIS_PASSWORD=${REDIS_PASSWORD}
+              networks:
+                - app-network
+              depends_on:
+                redis:
+                  condition: service_healthy
+
+            frontend:
+              image: job-frontend:latest
+              ports:
+                - "3000:3000"
+              environment:
+                - API_URL=http://api:8000
+                - PORT=3000
+              networks:
+                - app-network
+              depends_on:
+                api:
+                  condition: service_healthy
+              healthcheck:
+                test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:3000/health"]
+                interval: 5s
+                timeout: 3s
+                retries: 12
+                start_period: 10s
+
+          networks:
+            app-network:
+              driver: bridge
+          COMPOSE_EOF
+
+          export REDIS_PASSWORD=testpassword123
+          docker compose -f docker-compose.deploy.yml up -d
+
+          echo "Waiting for health checks to pass (max 60s)..."
+          for i in $(seq 1 12); do
+            api_healthy=$(docker inspect --format='{{.State.Health.Status}}' "hng14-stage2-devops-api-1" 2>/dev/null || echo "not_found")
+            frontend_healthy=$(docker inspect --format='{{.State.Health.Status}}' "hng14-stage2-devops-frontend-1" 2>/dev/null || echo "not_found")
+
+            echo "API: $api_healthy, Frontend: $frontend_healthy"
+
+            if [ "$api_healthy" = "healthy" ] && [ "$frontend_healthy" = "healthy" ]; then
+              echo "All services passed health checks. Deployment successful."
+              exit 0
+            fi
+            sleep 5
+          done
+
+          echo "Health checks did not pass within 60 seconds. Rolling back..."
+          docker compose -f docker-compose.deploy.yml down
+          echo "Deployment aborted. Old containers remain stopped."
+          exit 1
+
+      - name: Clean up
+        if: always()
+        run: |
+          rm -f docker-compose.deploy.yml docker-compose.integration.yml
