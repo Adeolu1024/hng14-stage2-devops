@@ -293,3 +293,26 @@ if not data:
     return {"error": "not found"}
 return {"job_id": job_id, "status": data[b"status"].decode() if isinstance(data[b"status"], bytes) else data["status"]}
 ```
+
+---
+
+## Bug 16: Redis Fails to Start Without Password Set
+
+- **File:** `docker-compose.yml`
+- **Line:** 7
+- **Problem:** `redis-server --requirepass ${REDIS_PASSWORD}` fails when `REDIS_PASSWORD` is not set (empty string). Redis rejects empty passwords and crashes immediately. Additionally, `redis-cli -a ""` in the healthcheck prints authentication warnings to stderr, causing the health check to fail even when Redis is running.
+- **Fix:** Added default password fallback `${REDIS_PASSWORD:-defaultpassword}` in all Redis-related configuration (command, healthcheck, service environment vars). Added `--no-auth-warning` flag to all `redis-cli` health checks.
+
+### Before
+```yaml
+command: redis-server --requirepass ${REDIS_PASSWORD}
+healthcheck:
+  test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+```
+
+### After
+```yaml
+command: redis-server --requirepass ${REDIS_PASSWORD:-defaultpassword}
+healthcheck:
+  test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD:-defaultpassword}", "ping"]
+```

@@ -197,7 +197,7 @@ jobs:
               networks:
                 - test-network
               healthcheck:
-                test: ["CMD", "redis-cli", "-a", "testpassword123", "ping"]
+                test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "testpassword123", "ping"]
                 interval: 5s
                 timeout: 3s
                 retries: 5
@@ -258,14 +258,19 @@ jobs:
           EOF
 
       - name: Start stack
-        run: docker compose -f docker-compose.integration.yml up -d
+        run: docker compose -p integration -f docker-compose.integration.yml up -d
 
       - name: Wait for services to be healthy
         run: |
           for i in $(seq 1 30); do
             healthy=true
             for svc in api frontend; do
-              status=$(docker inspect --format='{{.State.Health.Status}}' "hng14-stage2-devops-$svc-1" 2>/dev/null || echo "not_found")
+              container=$(docker compose -p integration -f docker-compose.integration.yml ps -q $svc 2>/dev/null)
+              if [ -z "$container" ]; then
+                healthy=false
+                break
+              fi
+              status=$(docker inspect --format='{{.State.Health.Status}}' "$container" 2>/dev/null || echo "not_found")
               if [ "$status" != "healthy" ]; then
                 healthy=false
                 break
@@ -305,7 +310,7 @@ jobs:
 
       - name: Tear down stack
         if: always()
-        run: docker compose -f docker-compose.integration.yml down -v
+        run: docker compose -p integration -f docker-compose.integration.yml down -v
 
   deploy:
     name: Deploy
@@ -346,7 +351,7 @@ jobs:
               networks:
                 - app-network
               healthcheck:
-                test: ["CMD", "redis-cli", "-a", "${REDIS_PASSWORD}", "ping"]
+                test: ["CMD", "redis-cli", "--no-auth-warning", "-a", "${REDIS_PASSWORD}", "ping"]
                 interval: 5s
                 timeout: 3s
                 retries: 5
@@ -407,12 +412,21 @@ jobs:
           COMPOSE_EOF
 
           export REDIS_PASSWORD=testpassword123
-          docker compose -f docker-compose.deploy.yml up -d
+          docker compose -p deploy -f docker-compose.deploy.yml up -d
 
           echo "Waiting for health checks to pass (max 60s)..."
           for i in $(seq 1 12); do
-            api_healthy=$(docker inspect --format='{{.State.Health.Status}}' "hng14-stage2-devops-api-1" 2>/dev/null || echo "not_found")
-            frontend_healthy=$(docker inspect --format='{{.State.Health.Status}}' "hng14-stage2-devops-frontend-1" 2>/dev/null || echo "not_found")
+            api_container=$(docker compose -p deploy -f docker-compose.deploy.yml ps -q api 2>/dev/null)
+            frontend_container=$(docker compose -p deploy -f docker-compose.deploy.yml ps -q frontend 2>/dev/null)
+
+            if [ -z "$api_container" ] || [ -z "$frontend_container" ]; then
+              echo "Containers not found yet..."
+              sleep 5
+              continue
+            fi
+
+            api_healthy=$(docker inspect --format='{{.State.Health.Status}}' "$api_container" 2>/dev/null || echo "not_found")
+            frontend_healthy=$(docker inspect --format='{{.State.Health.Status}}' "$frontend_container" 2>/dev/null || echo "not_found")
 
             echo "API: $api_healthy, Frontend: $frontend_healthy"
 
@@ -424,7 +438,7 @@ jobs:
           done
 
           echo "Health checks did not pass within 60 seconds. Rolling back..."
-          docker compose -f docker-compose.deploy.yml down
+          docker compose -p deploy -f docker-compose.deploy.yml down
           echo "Deployment aborted. Old containers remain stopped."
           exit 1
 
